@@ -1,0 +1,443 @@
+# STEP 1: Setup
+# -------------------------------------
+!pip install torch torchvision tensorboardX yfinance pandas
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset
+from tensorboardX import SummaryWriter
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+from scipy.signal import find_peaks
+import yfinance as yf
+import pandas as pd # Corrected import statement
+from sklearn.preprocessing import MinMaxScaler
+import time
+
+# Check for CUDA availability
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Define a global variable for tracking energy (placeholder)
+energy_consumption = 0
+
+# Function to simulate energy consumption (replace with actual monitoring if possible)
+def simulate_energy_consumption(batch_size, model_complexity, learning_rate, duration):
+    # This is a very rough approximation
+    return batch_size * model_complexity * learning_rate * duration * 1e-6  # Arbitrary scaling
+
+# STEP 2: Define learning_gain and ATL Logic
+# -------------------------------------
+def compute_learning_gain(loss, prev_loss, alpha=0.1):
+    """
+    Computes the learning gain g(t) based on the change in loss.
+    """
+    if prev_loss is None:
+        return 0.5  # neutral start
+    delta = prev_loss - loss
+    return 1 - alpha * (delta / (prev_loss + 1e-8))
+
+def atl_lr_modulation(base_lr, learning_gain):
+    """
+    Modulates the learning rate based on the learning gain.
+    """
+    return base_lr * (1 + 0.5 * np.sin(2 * np.pi * learning_gain))  # sample modulation
+
+# STEP 3: Load Stock Market Dataset (Now for Multiple Stocks)
+# -------------------------------------
+def load_stock_data(ticker="AAPL", period="5y", interval="1d"):
+    """
+    Loads stock data with Open, High, Low, Close, and Volume from yfinance.
+    """
+    data = yf.download(ticker, period=period, interval=interval)
+    if data.empty:
+        raise ValueError(f"Could not download data for {ticker}")
+    return data[['Open', 'High', 'Low', 'Close', 'Volume']]
+
+def preprocess_data(data, sequence_length=20, prediction_horizon=1):
+    """
+    Preprocesses the data into sequences for LSTM, now handling multiple features.
+    Returns sequences, scaler, scaled_data, and original dates for targets.
+    """
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(data)
+    dates = data.index[sequence_length + prediction_horizon - 1:]
+    sequences = []
+    for i in range(len(scaled_data) - sequence_length - prediction_horizon + 1):
+        input_seq = scaled_data[i:i + sequence_length]
+        target = scaled_data[i + sequence_length + prediction_horizon - 1, 3]  # Predict 'Close' price (index 3)
+        sequences.append((input_seq, target))
+    return sequences, scaler, scaled_data, dates
+
+class StockDataset(Dataset):
+    def __init__(self, sequences):
+        self.sequences = sequences
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        seq, target = self.sequences[idx]
+        return torch.tensor(seq, dtype=torch.float32), torch.tensor(target, dtype=torch.float32).unsqueeze(0) # Target needs to be [1]
+
+# STEP 4: Define LSTM Model (Now with More Layers)
+# -------------------------------------
+class LSTMModel(nn.Module):
+    def __init__(self, input_size=5, hidden_size=50, num_layers=2, output_size=1): # input_size is now 5, num_layers increased to 2
+        super(LSTMModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.fc(out[:, -1, :])  # Take the output of the last time step
+        return out
+
+# STEP 5: Train and Evaluate Model with learning_gain and Optional ATL
+# -------------------------------------
+def evaluate_model(model, dataloader, criterion, scaler, scaled_data_shape):
+    model.eval()
+    total_loss = 0
+    all_predictions = []
+    all_targets = []
+    with torch.no_grad():
+        for seq, target in dataloader:
+            seq, target = seq.to(device), target.to(device)
+            outputs = model(seq)
+            loss = criterion(outputs, target)
+            total_loss += loss.item() * seq.size(0)
+
+            # Inverse transform predictions and targets
+            dummy_output = torch.zeros(outputs.shape[0], scaled_data_shape[1])
+            dummy_output[:, 3] = outputs.squeeze().cpu()
+            predictions = scaler.inverse_transform(dummy_output)[:, 3]
+
+            dummy_target = torch.zeros(target.shape[0], scaled_data_shape[1])
+            dummy_target[:, 3] = target.squeeze().cpu()
+            targets = scaler.inverse_transform(dummy_target)[:, 3]
+
+            all_predictions.extend(predictions)
+            all_targets.extend(targets)
+
+    return total_loss / len(dataloader.dataset), np.array(all_predictions), np.array(all_targets)
+
+def train_with_gt(model, optimizer, criterion, dataloader, writer, use_atl=False, epoch=0):
+    """
+    Trains the model for one epoch, optionally using Adaptive Transfer Learning (ATL).
+
+    Args:
+        model (nn.Module): The LSTM model to train.
+        optimizer (optim.Optimizer): The optimizer to use for training.
+        criterion (nn.Module): The loss function.
+        dataloader (DataLoader): The data loader for the training data.
+        writer (SummaryWriter): TensorBoard writer for logging.
+        use_atl (bool, optional): Whether to use ATL for learning rate modulation. Defaults to False.
+        epoch (int, optional): The current epoch number. Defaults to 0.
+    """
+    global energy_consumption
+    model.train()
+    learning_gain_vals = []
+    prev_loss = None
+    total_loss = 0
+    start_time = time.time()
+    batch_size = dataloader.batch_size # Get batch size from the dataloader
+
+    for step, (seq, target) in enumerate(dataloader):
+        seq, target = seq.to(device), target.to(device)
+        optimizer.zero_grad()
+        outputs = model(seq)
+        loss = criterion(outputs, target)
+        loss.backward()
+        total_loss += loss.item() * seq.size(0)
+
+        # Compute learning gain
+        loss_val = loss.item()
+        learning_gain = compute_learning_gain(loss_val, prev_loss)
+        learning_gain_vals.append(learning_gain)
+        prev_loss = loss_val
+
+        # Optionally modulate LR via ATL
+        if use_atl:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = atl_lr_modulation(base_lr, learning_gain)
+
+        optimizer.step()
+
+        # Logging
+        writer.add_scalar(f"Train/Loss/Step", loss_val, epoch * len(dataloader) + step)
+        writer.add_scalar(f"Train/learning_gain/Step", learning_gain, epoch * len(dataloader) + step)
+
+    epoch_loss = total_loss / len(dataloader.dataset)
+    end_time = time.time()
+    duration = end_time - start_time
+    # Simulate energy consumption per epoch
+    energy_consumption += simulate_energy_consumption(batch_size, sum(p.numel() for p in model.parameters()), optimizer.param_groups[0]['lr'], duration)
+    writer.add_scalar(f"Train/Loss/Epoch", epoch_loss, epoch)
+    writer.add_scalar(f"Train/Energy/Epoch", energy_consumption, epoch)
+
+    return learning_gain_vals, epoch_loss
+
+# STEP 6: Run Experiment for Top 10 Stocks
+# -------------------------------------
+top_10_stocks = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "BRK.A", "TSLA", "JPM", "V", "JNJ"] # Example top 10
+num_epochs = 50 # Increased number of epochs
+base_lr = 0.001
+criterion = nn.MSELoss()  # Mean Squared Error for regression
+sequence_length = 20
+prediction_horizon = 30 # Increased prediction horizon to 30 days
+batch_size = 64 # Define batch size here
+
+all_results = {}
+
+for ticker in top_10_stocks:
+    print(f"\n--- Training and Evaluating for {ticker} ---")
+    all_results[ticker] = {}
+
+    # Load and preprocess data
+    try:
+        raw_data = load_stock_data(ticker=ticker, period='5y')
+        sequences, scaler, scaled_data, target_dates = preprocess_data(raw_data, sequence_length, prediction_horizon)
+        scaled_data_shape = scaled_data.shape
+        train_size = int(len(sequences) * 0.8)
+        train_sequences = sequences[:train_size]
+        test_sequences = sequences[train_size:]
+        test_dates = target_dates[train_size:] # Get corresponding dates for the test set
+
+        train_dataset = StockDataset(train_sequences)
+        test_dataset = StockDataset(test_sequences)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+        # BASELINE
+        print("Training Baseline Model...")
+        model_base = LSTMModel(input_size=5, num_layers=2).to(device)
+        optimizer_base = optim.Adam(model_base.parameters(), lr=base_lr)
+        writer_base = SummaryWriter(f"runs/{ticker}_Complex_LSTM_Baseline_predict_{prediction_horizon}_day")
+        energy_consumption_base = 0
+        baseline_losses = []
+        baseline_learning_gain_history = []
+        start_time_base_train = time.time()
+        for epoch in range(num_epochs):
+            learning_gain_base, train_loss_base = train_with_gt(model_base, optimizer_base, criterion, train_loader, writer_base, use_atl=False, epoch=epoch)
+            baseline_losses.append(train_loss_base)
+            baseline_learning_gain_history.extend(learning_gain_base)
+            test_loss_base, _, _ = evaluate_model(model_base, test_loader, criterion, scaler, scaled_data_shape)
+            writer_base.add_scalar("Test/Loss/Epoch", test_loss_base, epoch)
+            print(f"Epoch [{epoch+1}/{num_epochs}] - Baseline Train Loss: {train_loss_base:.4f}, Test Loss: {test_loss_base:.4f}, Energy: {energy_consumption_base:.6f} (simulated)")
+            energy_consumption_base += energy_consumption
+        end_time_base_train = time.time()
+        training_time_base = end_time_base_train - start_time_base_train
+        test_loss_base_final, predictions_base, targets_base = evaluate_model(model_base, test_loader, criterion, scaler, scaled_data_shape)
+        writer_base.close()
+
+        # ATL
+        print("\nTraining ATL-enhanced Model...")
+        model_atl = LSTMModel(input_size=5, num_layers=2).to(device)
+        optimizer_atl = optim.Adam(model_atl.parameters(), lr=base_lr)
+        writer_atl = SummaryWriter(f"runs/{ticker}_Complex_LSTM_ATL_predict_{prediction_horizon}_day")
+        energy_consumption_atl = 0
+        atl_losses = []
+        atl_learning_gain_history = []
+        start_time_atl_train = time.time()
+        for epoch in range(num_epochs):
+            learning_gain_atl, train_loss_atl = train_with_gt(model_atl, optimizer_atl, criterion, train_loader, writer_atl, use_atl=True, epoch=epoch)
+            atl_losses.append(train_loss_atl)
+            atl_learning_gain_history.extend(learning_gain_atl)
+            test_loss_atl, _, _ = evaluate_model(model_atl, test_loader, criterion, scaler, scaled_data_shape)
+            writer_atl.add_scalar("Test/Loss/Epoch", test_loss_atl, epoch)
+            print(f"Epoch [{epoch+1}/{num_epochs}] - ATL Train Loss: {train_loss_atl:.4f}, Test Loss: {test_loss_atl:.4f}, Energy: {energy_consumption_atl:.6f} (simulated)")
+            energy_consumption_atl += energy_consumption
+        end_time_atl_train = time.time()
+        training_time_atl = end_time_atl_train - start_time_atl_train
+        test_loss_atl_final, predictions_atl, targets_atl = evaluate_model(model_atl, test_loader, criterion, scaler, scaled_data_shape)
+        writer_atl.close()
+
+        # Make Prediction for the Next 30 Days
+        model_base.eval()
+        model_atl.eval()
+        future_predictions_base = []
+        future_predictions_atl = []
+
+        last_sequence = scaled_data[-sequence_length:].copy()
+        for _ in range(30):
+            last_sequence_tensor_base = torch.tensor(last_sequence, dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad():
+                predicted_scaled_base = model_base(last_sequence_tensor_base).cpu().numpy()
+            future_predictions_base.append(predicted_scaled_base[0, 0])
+            last_sequence = np.roll(last_sequence, shift=-1, axis=0)
+            last_sequence[-1, 3] = predicted_scaled_base[0, 0] # Update with the predicted 'Close' price
+
+        last_sequence = scaled_data[-sequence_length:].copy()
+        for _ in range(30):
+            last_sequence_tensor_atl = torch.tensor(last_sequence, dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad():
+                predicted_scaled_atl = model_atl(last_sequence_tensor_atl).cpu().numpy()
+            future_predictions_atl.append(predicted_scaled_atl[0, 0])
+            last_sequence = np.roll(last_sequence, shift=-1, axis=0)
+            last_sequence[-1, 3] = predicted_scaled_atl[0, 0] # Update with the predicted 'Close' price
+
+        # Inverse transform the future predictions
+        dummy_future_base = np.zeros((len(future_predictions_base), scaled_data.shape[1]))
+        dummy_future_base[:, 3] = np.array(future_predictions_base).flatten()
+        predicted_prices_base_future = scaler.inverse_transform(dummy_future_base)[:, 3]
+
+        dummy_future_atl = np.zeros((len(future_predictions_atl), scaled_data.shape[1]))
+        dummy_future_atl[:, 3] = np.array(future_predictions_atl).flatten()
+        predicted_prices_atl_future = scaler.inverse_transform(dummy_future_atl)[:, 3]
+
+        # Measure Latency (moved after future prediction)
+        last_sequence_predict = scaled_data[-sequence_length:]
+        last_sequence_tensor_predict = torch.tensor(last_sequence_predict, dtype=torch.float32).unsqueeze(0).to(device)
+
+        start_time_base_predict = time.time()
+        with torch.no_grad():
+            predicted_scaled_base_single = model_base(last_sequence_tensor_predict).cpu().numpy()
+        end_time_base_predict = time.time()
+        latency_base = end_time_base_predict - start_time_base_predict
+
+        start_time_atl_predict = time.time()
+        with torch.no_grad():
+            predicted_scaled_atl_single = model_atl(last_sequence_tensor_predict).cpu().numpy()
+        end_time_atl_predict = time.time()
+        latency_atl = end_time_atl_predict - start_time_atl_predict
+
+        dummy_base_single = np.zeros((1, scaled_data.shape[1]))
+        dummy_base_single[:, 3] = predicted_scaled_base_single
+        predicted_price_base_single = scaler.inverse_transform(dummy_base_single)[0][3]
+
+        dummy_atl_single = np.zeros((1, scaled_data.shape[1]))
+        dummy_atl_single[:, 3] = predicted_scaled_atl_single
+        predicted_price_atl_single = scaler.inverse_transform(dummy_atl_single)[0][3]
+
+        # Store Results
+        all_results[ticker]['baseline'] = {
+            'final_train_loss': baseline_losses[-1],
+            'final_test_loss': test_loss_base_final,
+            'energy_consumption': energy_consumption_base,
+            'latency': latency_base,
+            'predicted_price': predicted_price_base_single,
+            'predictions': predictions_base,
+            'targets': targets_base,
+            'future_predictions': predicted_prices_base_future
+        }
+        all_results[ticker]['atl'] = {
+            'final_train_loss': atl_losses[-1],
+            'final_test_loss': test_loss_atl_final,
+            'energy_consumption': energy_consumption_atl,
+            'latency': latency_atl,
+            'predicted_price': predicted_price_atl_single,
+            'predictions': predictions_atl,
+            'targets': targets_base,
+            'future_predictions': predicted_prices_atl_future
+        }
+
+    except ValueError as e:
+        print(f"Error processing {ticker}: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred while processing {ticker}: {e}")
+
+# STEP 7: Plot Stock Prices for All Stocks
+# -------------------------------------
+def plot_stock_prices(targets, predictions_base, predictions_atl, future_predictions_base, future_predictions_atl, dates, ticker):
+    """
+    Plots the actual stock prices, baseline predictions, ATL predictions, and future predictions.
+    Uses actual dates for the x-axis.
+    """
+    plt.figure(figsize=(16, 8))
+    # Plot actual prices
+    plt.plot(dates[-100:], targets[-100:], label=f"{ticker} Ground Truth", color='blue')
+    # Plot baseline predictions
+    plt.plot(dates[-len(predictions_base):][-100:], predictions_base[-100:], label=f"{ticker} Baseline Forecast", color='red', linestyle='--')
+    # Plot ATL predictions
+    plt.plot(dates[-len(predictions_atl):][-100:], predictions_atl[-100:], label=f"{ticker} ATL Forecast", color='green', linestyle='--')
+
+    # Generate dates for future predictions
+    last_date = pd.to_datetime(dates[-1])
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=30, freq='D')
+
+    # Plot future baseline predictions
+    plt.plot(future_dates, future_predictions_base, label=f"{ticker} Baseline Future (30 Days)", color='orange', linestyle='-.')
+    # Plot future ATL predictions
+    plt.plot(future_dates, future_predictions_atl, label=f"{ticker} ATL Future (30 Days)", color='purple', linestyle='-.')
+
+    plt.title(f"Stock Price Forecast vs. Ground Truth for {ticker} (Last 100 Test Samples and 30-Day Future Prediction)")
+    plt.xlabel("Date")
+    plt.ylabel("Stock Price")
+    plt.legend()
+    plt.grid(True)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# Plot for all stocks in the list
+for ticker in top_10_stocks:
+    if ticker in all_results and 'baseline' in all_results[ticker] and 'atl' in all_results[ticker]:
+        # Load the original dates to extend for future predictions
+        try:
+            raw_data_plot = load_stock_data(ticker=ticker, period='5y')
+            original_dates = raw_data_plot.index
+
+            # Get the dates corresponding to the targets
+            sequences_plot, _, _, target_dates_plot = preprocess_data(raw_data_plot, sequence_length, prediction_horizon)
+            train_size_plot = int(len(sequences_plot) * 0.8)
+            test_dates_plot = target_dates_plot[train_size_plot:]
+
+            plot_stock_prices(
+                all_results[ticker]['baseline']['targets'],
+                all_results[ticker]['baseline']['predictions'],
+                all_results[ticker]['atl']['predictions'],
+                all_results[ticker]['baseline']['future_predictions'],
+                all_results[ticker]['atl']['future_predictions'],
+                test_dates_plot,
+                ticker
+            )
+        except Exception as e:
+            print(f"Error during plotting for {ticker}: {e}")
+
+# STEP 8: Create Summary Table of Metrics for All Stocks
+# -------------------------------------
+summary_data = []
+for ticker in top_10_stocks:
+    if ticker in all_results:
+        if 'baseline' in all_results[ticker]:
+            summary_data.append({
+                'Stock': ticker,
+                'Model': 'Baseline',
+                'Final Train Loss': f"{all_results[ticker]['baseline']['final_train_loss']:.4f}",
+                'Final Test Loss': f"{all_results[ticker]['baseline']['final_test_loss']:.4f}",
+                'Energy Consumption': f"{all_results[ticker]['baseline']['energy_consumption']:.6f}",
+                'Prediction Latency': f"{all_results[ticker]['baseline']['latency']:.6f}",
+                'Predicted Price (Next Day)': f"{all_results[ticker]['baseline']['predicted_price']:.2f}"
+            })
+        if 'atl' in all_results[ticker]:
+            summary_data.append({
+                'Stock': ticker,
+                'Model': 'ATL',
+                'Final Train Loss': f"{all_results[ticker]['atl']['final_train_loss']:.4f}",
+                'Final Test Loss': f"{all_results[ticker]['atl']['final_test_loss']:.4f}",
+                'Energy Consumption': f"{all_results[ticker]['atl']['energy_consumption']:.6f}",
+                'Prediction Latency': f"{all_results[ticker]['atl']['latency']:.6f}",
+                'Predicted Price (Next Day)': f"{all_results[ticker]['atl']['predicted_price']:.2f}"
+            })
+
+summary_df = pd.DataFrame(summary_data)
+print("\n--- Summary of Metrics for Top 10 Stocks ---")
+print(summary_df)
+
+# STEP 9: Launch TensorBoard
+# -------------------------------------
+print("\nLaunching TensorBoard...")
+print("You can access TensorBoard by running the command below in a new cell:")
+print("%tensorboard --logdir runs")
+print("\nNote: If you are running this in an environment where '%tensorboard' doesn't work (like some cloud platforms),")
+print("you might need to use alternative methods to view TensorBoard, such as the TensorBoard web application.")
