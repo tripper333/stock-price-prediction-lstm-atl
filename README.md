@@ -1,5 +1,5 @@
 # stock-price-prediction-lstm-atl
-Stock price prediction using LSTM with baseline and with Adaptive Transfer Learning performance and learning efficiency 
+Stock price prediction using LSTM with baseline and with Adaptive Torodial Learning performance and learning efficiency 
 # Stock Price Prediction with LSTM and Adaptive Transfer Learning
 
 This repository contains Python code for forecasting stock prices using Long Short-Term Memory (LSTM) neural networks. The project compares a baseline LSTM model with an enhanced version that incorporates an Adaptive Torodial Learning (ATL) mechanism to dynamically adjust the learning rate during training.
