@@ -1,4 +1,4 @@
-# Stock Price Prediction with LSTM and Adaptive Toroidal Learning Performance and Learning Efficiency
+# Stock Price Prediction with LSTM and Adaptive Toroidal Learning (ATL): Neural Network Optimization and Learning Efficiency
 
 This repository contains Python code for forecasting stock prices using Long Short-Term Memory (LSTM) neural networks. The project compares a baseline LSTM model with an enhanced version that incorporates an **Adaptive Toroidal Learning (ATL)** mechanism. This experiment serves as a **toy example** to explore and test new learning paradigms where **self-reflection** enables emergent learning and intelligence through dynamic performance improvement updates.
 
